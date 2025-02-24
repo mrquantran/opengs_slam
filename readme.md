@@ -30,7 +30,7 @@
 1. Clone OpenGS-SLAM.
 
 ```bash
-git clone  --recursive
+git clone https://github.com/3DAgentWorld/OpenGS-SLAM --recursive
 cd opengs-slam
 ```
 
