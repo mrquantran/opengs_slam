@@ -101,7 +101,16 @@ bash run_waymo.sh
 
 - For more details about Demo, please refer to [MonoGS](https://github.com/muskie82/MonoGS), as we are using its visualization code.
 
-  
+# Citation
 
+If you found this code/work to be useful in your own research, please considering citing the following:
 
+```bibtex
+@article{yu2025rgb,
+  title={Rgb-only gaussian splatting slam for unbounded outdoor scenes},
+  author={Yu, Sicheng and Cheng, Chong and Zhou, Yifan and Yang, Xiaojun and Wang, Hao},
+  journal={arXiv preprint arXiv:2502.15633},
+  year={2025}
+}
 
+```
