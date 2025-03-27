@@ -31,7 +31,7 @@
 
 ```bash
 git clone https://github.com/3DAgentWorld/OpenGS-SLAM.git --recursive
-cd opengs-slam
+cd OpenGS-SLAM
 ```
 
 2. Setup the environment.
@@ -41,7 +41,14 @@ conda env create -f environment.yml
 conda activate opengs-slam
 ```
 
-3. Compile the cuda kernels for RoPE (as in CroCo v2 and DUSt3R).
+3. Compile submodules for Gaussian splatting
+
+```bash
+pip install submodules/simple-knn
+pip install submodules/diff-gaussian-rasterization
+```
+
+4. Compile the cuda kernels for RoPE (as in CroCo v2 and DUSt3R).
 
 ```bash
 cd croco/models/curope/
@@ -71,29 +78,29 @@ Please note that you must agree to the DUSt3R license when using it.
 
 The processed data for the 9 Waymo segments can be downloaded via [baidu](https://pan.baidu.com/s/1I1rnB6B8k2d4wzcRMT6gjA?pwd=omcg ) or [google](https://drive.google.com/drive/folders/1xUyNuNzUtsvZIV_q5Qz9zIXMGoMbLuCr?usp=sharing).
 
+Save data under the `datasets/waymo` directory.
+
 ## Run
 
 ```bash
-## Taking segment-100613 as an example
+## Taking 100613 as an example
 CUDA_VISIBLE_DEVICES=0 python slam.py --config configs/mono/waymo/100613.yaml
 
-## All 9 Waymo segments
+## All 9 Waymo scenes
 bash run_waymo.sh
 ```
 
 ## Demo
 
-- If you want to view the real-time interactive SLAM window, please change *'Results-use_gui'* in *base_config.yaml* to True.
+- If you want to view the real-time interactive SLAM window, please change `Results-use_gui` in `base_config.yaml` to True.
 
 - When running on an Ubuntu system, a GUI window will pop up.
 
 ## Run on other dataset
 
-- Please organize your data format and modify the code in *utils/dataset.py*.
+- Please organize your data format and modify the code in `utils/dataset.py`.
 
 - Depth map input interface is still retained in the code, although we didn't use it for SLAM.
-
-
 
 # Acknowledgement
 

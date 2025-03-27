@@ -505,6 +505,7 @@ class FrontEnd(mp.Process):
                         opacity=render_pkg["opacity"],
                         init=False,
                     )
+                    Log("new keyframe: ", cur_frame_idx)
                     self.request_keyframe(   
                         cur_frame_idx, viewpoint, self.current_window, depth_map
                     )

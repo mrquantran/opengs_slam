@@ -162,7 +162,7 @@ class SLAM:
             end_time = time.time()
             render_time = end_time - start_time
             ave_time = render_time / N_frames
-            print("average render time is:", ave_time)
+            #print("average render time is:", ave_time)
             
             if self.color_refinement:
                 # re-used the frontend queue to retrive the gaussians from the backend.

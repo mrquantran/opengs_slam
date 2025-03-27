@@ -87,7 +87,7 @@ def eval_ate(frames, kf_ids, save_dir, iterations, final=False, monocular=False,
 
     for kf_id in kf_ids:
     #for kf_id in range(latest_frame_idx):
-        print(kf_id)
+        #print(kf_id)
         kf = frames[kf_id]
         pose_est = np.linalg.inv(gen_pose_matrix(kf.R, kf.T))
         pose_gt = np.linalg.inv(gen_pose_matrix(kf.R_gt, kf.T_gt))
