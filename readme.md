@@ -21,7 +21,7 @@
 
 [[Project page](https://3dagentworld.github.io/opengs-slam/)],[[arxiv](https://arxiv.org/abs/2502.15633)]  
 
-
+⭐Please also check out our futher work[[ICCV 2025] S3PO-GS](https://github.com/3DAgentWorld/S3PO-GS)，which also focus on RGB-Only outdoor SLAM with better performance.
 
 # Getting Started
 
@@ -110,7 +110,7 @@ bash run_waymo.sh
 
 # Citation
 
-If you found this code/work to be useful in your own research, please considering citing the following:
+If you found our code/work to be useful in your own research, please considering citing the following:
 
 ```bibtex
 @article{yu2025rgb,
@@ -120,4 +120,10 @@ If you found this code/work to be useful in your own research, please considerin
   year={2025}
 }
 
+@article{cheng2025outdoor,
+  title={Outdoor Monocular SLAM with Global Scale-Consistent 3D Gaussian Pointmaps},
+  author={Cheng, Chong and Yu, Sicheng and Wang, Zijian and Zhou, Yifan and Wang, Hao},
+  journal={arXiv preprint arXiv:2507.03737},
+  year={2025}
+}
 ```
