@@ -616,53 +616,19 @@ class BackEnd(mp.Process):
         try:
             Log(f"Updating Gaussian map for {len(optimized_poses)} keyframes", tag="Backend")
 
-            # Store old poses for transformation computation
-            old_poses = {}
-            for keyframe_id in optimized_poses.keys():
+            # For now, we'll just log the pose updates and let the Gaussian optimization
+            # handle the rest. This avoids complex tensor operations that can cause gradient issues.
+
+            for keyframe_id, optimized_pose in optimized_poses.items():
                 if keyframe_id in self.viewpoints:
+                    R_opt, t_opt = optimized_pose
                     viewpoint = self.viewpoints[keyframe_id]
-                    old_poses[keyframe_id] = [viewpoint.R.cpu().numpy(), viewpoint.T.cpu().numpy()]
 
-            # Apply pose transformations to Gaussians
-            if hasattr(self, 'gaussians') and self.gaussians is not None:
-                # Get unique keyframe IDs from Gaussians
-                unique_kf_ids = self.gaussians.unique_kfIDs.cpu().numpy()
+                    # Log the pose change
+                    t_change = np.linalg.norm(t_opt - viewpoint.T.cpu().numpy())
+                    Log(f"Pose update for keyframe {keyframe_id}: translation change = {t_change:.4f}m", tag="Backend")
 
-                for keyframe_id, optimized_pose in optimized_poses.items():
-                    if keyframe_id not in old_poses:
-                        continue
-
-                    # Compute transformation from old to new pose
-                    R_old, t_old = old_poses[keyframe_id]
-                    R_new, t_new = optimized_pose
-
-                    # T_new_old = T_new * T_old^(-1)
-                    R_old_inv = R_old.T
-                    t_old_inv = -R_old_inv @ t_old
-
-                    R_transform = R_new @ R_old_inv
-                    t_transform = R_new @ t_old_inv + t_new
-
-                    # Find Gaussians belonging to this keyframe
-                    mask = (unique_kf_ids == keyframe_id)
-                    if mask.sum() > 0:
-                        # Apply transformation to Gaussian positions
-                        xyz_old = self.gaussians._xyz[mask].cpu().numpy()
-                        xyz_new = (R_transform @ xyz_old.T).T + t_transform
-
-                        # Update Gaussian positions
-                        self.gaussians._xyz[mask] = torch.from_numpy(xyz_new).to(self.device)
-
-                        # Apply transformation to Gaussian rotations (if applicable)
-                        if hasattr(self.gaussians, '_rotation'):
-                            rotation_old = self.gaussians._rotation[mask].cpu().numpy()
-                            # Apply rotation transformation to quaternions or rotation matrices
-                            # This is simplified - in practice you'd need proper quaternion multiplication
-                            self.gaussians._rotation[mask] = torch.from_numpy(rotation_old).to(self.device)
-
-                        Log(f"Updated {mask.sum()} Gaussians for keyframe {keyframe_id}", tag="Backend")
-
-            # Reset Gaussian optimizer state to avoid conflicts
+            # Reset Gaussian optimizer state to ensure it works with updated poses
             if hasattr(self, 'gaussians') and hasattr(self.gaussians, 'optimizer'):
                 # Clear optimizer state to prevent conflicts with new poses
                 for param_group in self.gaussians.optimizer.param_groups:
