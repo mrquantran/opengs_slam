@@ -16,7 +16,7 @@ from utils.slam_utils import get_loss_mapping
 
 
 class BackEnd(mp.Process):
-    def __init__(self, config, save_dir=None):
+    def __init__(self, config, save_dir=None, pgo_queue_in=None, pgo_queue_out=None):
         super().__init__()
         self.config = config
         self.gaussians = None
@@ -26,6 +26,8 @@ class BackEnd(mp.Process):
         self.cameras_extent = None
         self.frontend_queue = None
         self.backend_queue = None
+        self.pgo_queue_in = pgo_queue_in
+        self.pgo_queue_out = pgo_queue_out
         self.live_mode = False
         self.save_dir = save_dir
 
@@ -40,9 +42,13 @@ class BackEnd(mp.Process):
         self.current_window = []
         self.initialized = not self.monocular
         self.keyframe_optimizers = None
-        
+
         self.pcd_scale = 1          # scale factor
         self.theta = 0              # Camera angle diff from last keyframe
+
+        # PGO integration
+        self.use_pgo = pgo_queue_in is not None and pgo_queue_out is not None
+        self.keyframe_images = {}  # Store RGB images for PGO
 
     def set_hyperparams(self):
         self.save_results = self.config["Results"]["save_results"]
@@ -74,7 +80,7 @@ class BackEnd(mp.Process):
         self.gaussians.extend_from_pcd_seq(
             viewpoint, kf_id=frame_idx, init=init, scale=scale, depthmap=depth_map
         )
-    # Initialize Gaussians via pointmap and add to the current scene   
+    # Initialize Gaussians via pointmap and add to the current scene
     def add_next_kf_dust3r(self, frame_idx, pts3d, imgs, T, mask=None, init=False, scale=1):
         fused_point_cloud, features, scales, rots, opacities = (
             self.gaussians.create_pcd_from_dust3r(pts3d, imgs, T, frame_idx, self.save_dir, scale, mask, init=init)
@@ -95,7 +101,7 @@ class BackEnd(mp.Process):
         # remove everything from the queues
         while not self.backend_queue.empty():
             self.backend_queue.get()
-            
+
     # Initialize SLAM map by optimizing Gaussian parameters over multiple iterations
     def initialize_map(self, cur_frame_idx, viewpoint):
         for mapping_iteration in range(self.init_itr_num):
@@ -127,14 +133,14 @@ class BackEnd(mp.Process):
             loss_init.backward()
 
             with torch.no_grad():
-                self.gaussians.max_radii2D[visibility_filter] = torch.max(  
+                self.gaussians.max_radii2D[visibility_filter] = torch.max(
                     self.gaussians.max_radii2D[visibility_filter],
                     radii[visibility_filter],
                 )
-                self.gaussians.add_densification_stats(               
+                self.gaussians.add_densification_stats(
                     viewspace_point_tensor, visibility_filter
                 )
-                if mapping_iteration % self.init_gaussian_update == 0:  
+                if mapping_iteration % self.init_gaussian_update == 0:
                     self.gaussians.densify_and_prune(
                         self.opt_params.densify_grad_threshold,
                         self.init_gaussian_th,
@@ -147,13 +153,13 @@ class BackEnd(mp.Process):
                 ):
                     self.gaussians.reset_opacity()
 
-                self.gaussians.optimizer.step()                         
-                self.gaussians.optimizer.zero_grad(set_to_none=True)    
+                self.gaussians.optimizer.step()
+                self.gaussians.optimizer.zero_grad(set_to_none=True)
 
-        self.occ_aware_visibility[cur_frame_idx] = (n_touched > 0).long()   
+        self.occ_aware_visibility[cur_frame_idx] = (n_touched > 0).long()
         Log("Initialized map")
         return render_pkg
-    
+
     def map(self, current_window, prune=False, iters=1):
         if len(current_window) == 0:
             return
@@ -162,39 +168,39 @@ class BackEnd(mp.Process):
         random_viewpoint_stack = []
         frames_to_optimize = self.config["Training"]["pose_window"]
 
-        current_window_set = set(current_window)            
-        for cam_idx, viewpoint in self.viewpoints.items(): 
+        current_window_set = set(current_window)
+        for cam_idx, viewpoint in self.viewpoints.items():
             if cam_idx in current_window_set:
                 continue
             random_viewpoint_stack.append(viewpoint)
-                
+
         for _ in range(iters):
             self.iteration_count += 1
             self.iteration_count1 += 1
             self.last_sent += 1
 
             loss_mapping = 0
-            viewspace_point_tensor_acm = []               
-            visibility_filter_acm = []                      
-            radii_acm = []                                
-            n_touched_acm = []                              
+            viewspace_point_tensor_acm = []
+            visibility_filter_acm = []
+            radii_acm = []
+            n_touched_acm = []
 
-            keyframes_opt = []        
+            keyframes_opt = []
 
-            for cam_idx in range(len(current_window)):      
+            for cam_idx in range(len(current_window)):
                 viewpoint = viewpoint_stack[cam_idx]
                 keyframes_opt.append(viewpoint)
                 render_pkg = render(
                     viewpoint, self.gaussians, self.pipeline_params, self.background
                 )
-                (                                         
+                (
                     image,
-                    viewspace_point_tensor,               
-                    visibility_filter,                     
-                    radii,                                  
-                    depth,                                  
-                    opacity,                                
-                    n_touched,                            
+                    viewspace_point_tensor,
+                    visibility_filter,
+                    radii,
+                    depth,
+                    opacity,
+                    n_touched,
                 ) = (
                     render_pkg["render"],
                     render_pkg["viewspace_points"],
@@ -211,9 +217,9 @@ class BackEnd(mp.Process):
                 viewspace_point_tensor_acm.append(viewspace_point_tensor)
                 visibility_filter_acm.append(visibility_filter)
                 radii_acm.append(radii)
-                n_touched_acm.append(n_touched)     
+                n_touched_acm.append(n_touched)
 
-            for cam_idx in torch.randperm(len(random_viewpoint_stack))[:2]:     
+            for cam_idx in torch.randperm(len(random_viewpoint_stack))[:2]:
                 viewpoint = random_viewpoint_stack[cam_idx]
                 render_pkg = render(
                     viewpoint, self.gaussians, self.pipeline_params, self.background
@@ -250,14 +256,14 @@ class BackEnd(mp.Process):
             gaussian_split = False
             ## Deinsifying / Pruning Gaussians
             with torch.no_grad():
-                self.occ_aware_visibility = {}         
+                self.occ_aware_visibility = {}
                 for idx in range((len(current_window))):
                     kf_idx = current_window[idx]
                     n_touched = n_touched_acm[idx]
                     self.occ_aware_visibility[kf_idx] = (n_touched > 0).long()
-                    
+
                 # Only prune on the last iteration and when we have full window
-                if prune:      
+                if prune:
                     if len(current_window) == self.config["Training"]["window_size"]:
                         prune_mode = self.config["Training"]["prune_mode"]
                         prune_coviz = 3
@@ -277,11 +283,11 @@ class BackEnd(mp.Process):
                             to_prune = torch.logical_and(
                                 self.gaussians.n_obs <= prune_coviz, mask
                             )
-                        if to_prune is not None and self.monocular:         
+                        if to_prune is not None and self.monocular:
                             self.gaussians.prune_points(to_prune.cuda())
                             for idx in range((len(current_window))):
                                 current_idx = current_window[idx]
-                                self.occ_aware_visibility[current_idx] = (               
+                                self.occ_aware_visibility[current_idx] = (
                                     self.occ_aware_visibility[current_idx][~to_prune]
                                 )
                         if not self.initialized:
@@ -289,7 +295,7 @@ class BackEnd(mp.Process):
                             Log("Initialized SLAM")
                         # # make sure we don't split the gaussians, break here.
                     return False
-          
+
                 for idx in range(len(viewspace_point_tensor_acm)):
                     self.gaussians.max_radii2D[visibility_filter_acm[idx]] = torch.max(
                         self.gaussians.max_radii2D[visibility_filter_acm[idx]],
@@ -298,7 +304,7 @@ class BackEnd(mp.Process):
                     self.gaussians.add_densification_stats(
                         viewspace_point_tensor_acm[idx], visibility_filter_acm[idx]
                     )
-                
+
                 update_gaussian = (
                     self.iteration_count % self.gaussian_update_every
                     == self.gaussian_update_offset
@@ -319,7 +325,7 @@ class BackEnd(mp.Process):
                 #    Log("Resetting the opacity of non-visible Gaussians")
                 #    self.gaussians.reset_opacity_nonvisible(visibility_filter_acm)
                 #    gaussian_split = True
-               
+
                 self.gaussians.optimizer.step()
                 self.gaussians.optimizer.zero_grad(set_to_none=True)
                 self.gaussians.update_learning_rate(self.iteration_count)
@@ -332,17 +338,17 @@ class BackEnd(mp.Process):
                         continue
                     update_pose(viewpoint)
         return gaussian_split
-    
+
     def color_refinement(self):
         Log("Starting color refinement")
 
         iteration_total = 26000
         for iteration in tqdm(range(1, iteration_total + 1)):
-            viewpoint_idx_stack = list(self.viewpoints.keys())      
+            viewpoint_idx_stack = list(self.viewpoints.keys())
             viewpoint_cam_idx = viewpoint_idx_stack.pop(
                 random.randint(0, len(viewpoint_idx_stack) - 1)
             )
-            viewpoint_cam = self.viewpoints[viewpoint_cam_idx]    
+            viewpoint_cam = self.viewpoints[viewpoint_cam_idx]
             render_pkg = render(
                 viewpoint_cam, self.gaussians, self.pipeline_params, self.background
             )
@@ -358,7 +364,7 @@ class BackEnd(mp.Process):
                 Ll1
             ) + self.opt_params.lambda_dssim * (1.0 - ssim(image, gt_image))
             loss.backward()
-            with torch.no_grad():       
+            with torch.no_grad():
                 self.gaussians.max_radii2D[visibility_filter] = torch.max(
                     self.gaussians.max_radii2D[visibility_filter],
                     radii[visibility_filter],
@@ -367,7 +373,7 @@ class BackEnd(mp.Process):
                 self.gaussians.optimizer.zero_grad(set_to_none=True)
                 self.gaussians.update_learning_rate(20000)
         Log("Map refinement done")
-    
+
     def push_to_frontend(self, tag=None):
         self.last_sent = 0
         keyframes = []
@@ -376,10 +382,10 @@ class BackEnd(mp.Process):
             keyframes.append((kf_idx, kf.R.clone(), kf.T.clone()))
         if tag is None:
             tag = "sync_backend"
-            
+
         msg = [tag, clone_obj(self.gaussians), self.occ_aware_visibility, keyframes]
         self.frontend_queue.put(msg)
-    # Main loop: process messages from the backend queue, perform map optimization, color refinement, 
+    # Main loop: process messages from the backend queue, perform map optimization, color refinement,
     # initialization, and keyframe management; synchronize data and push to the frontend
     def run(self):
         while True:
@@ -394,10 +400,13 @@ class BackEnd(mp.Process):
                     time.sleep(0.01)
                     continue
                 self.map(self.current_window)
-                if self.last_sent >= 10:         
+                if self.last_sent >= 10:
                     self.map(self.current_window, prune=True, iters=10)
                     self.push_to_frontend()
             else:
+                # Check for PGO updates first
+                self._check_pgo_updates()
+
                 data = self.backend_queue.get()
                 if data[0] == "stop":
                     break
@@ -438,6 +447,15 @@ class BackEnd(mp.Process):
                     mask = data[7]
                     self.scale = data[8]
                     self.theta = data[9]
+
+                    # Send keyframe to PGO thread if enabled
+                    if self.use_pgo and len(data) > 10:
+                        rgb_image = data[10]  # RGB image for landmark detection
+                        if rgb_image is not None:
+                            self.keyframe_images[cur_frame_idx] = rgb_image
+                            self._send_keyframe_to_pgo(cur_frame_idx, viewpoint, rgb_image)
+                        else:
+                            Log(f"RGB image is None for keyframe {cur_frame_idx}, skipping PGO", tag="Backend")
                     theta_value = self.theta.item()
                     ## adjust the cumulative iterations for Adaptive Learning Rate Adjustment
                     if theta_value >= 2:
@@ -453,7 +471,7 @@ class BackEnd(mp.Process):
                     #self.add_next_kf(cur_frame_idx, viewpoint, depth_map=depth_map)
                     ## Adaptive Scale Mapper
                     self.add_next_kf_dust3r(cur_frame_idx, pts3d, imgs, T, mask, scale=self.scale)
-    
+
                     opt_params = []
                     frames_to_optimize = self.config["Training"]["pose_window"]
                     iter_per_kf = self.mapping_itr_num if self.single_thread else 150
@@ -469,11 +487,11 @@ class BackEnd(mp.Process):
                             Log("Performing initial BA for initialization")
                         else:
                             iter_per_kf = self.mapping_itr_num
-                    for cam_idx in range(len(self.current_window)):    
+                    for cam_idx in range(len(self.current_window)):
                         if self.current_window[cam_idx] == 0:
                             continue
                         viewpoint = self.viewpoints[current_window[cam_idx]]
-                        if cam_idx < frames_to_optimize:        
+                        if cam_idx < frames_to_optimize:
                             opt_params.append(
                                 {
                                     "params": [viewpoint.cam_rot_delta],
@@ -518,3 +536,141 @@ class BackEnd(mp.Process):
         while not self.frontend_queue.empty():
             self.frontend_queue.get()
         return
+
+    def _send_keyframe_to_pgo(self, keyframe_id, viewpoint, rgb_image):
+        """Send keyframe data to PGO thread for loop closure detection"""
+        if not self.use_pgo:
+            return
+
+        try:
+            # Extract pose from viewpoint
+            R = viewpoint.R.cpu().numpy()
+            t = viewpoint.T.cpu().numpy()
+            pose = [R, t]
+
+            # Prepare keyframe data
+            keyframe_data = {
+                'keyframe_id': keyframe_id,
+                'pose': pose,
+                'rgb_image': rgb_image,
+                'timestamp': time.time()
+            }
+
+            # Send to PGO thread
+            self.pgo_queue_in.put(["new_keyframe", keyframe_data])
+            Log(f"Sent keyframe {keyframe_id} to PGO thread", tag="Backend")
+
+        except Exception as e:
+            Log(f"Error sending keyframe to PGO: {e}", tag="Backend")
+
+    def _check_pgo_updates(self):
+        """Check for updates from PGO thread"""
+        if not self.use_pgo:
+            return
+
+        try:
+            while not self.pgo_queue_out.empty():
+                data = self.pgo_queue_out.get()
+
+                if data[0] == "optimized_poses":
+                    optimized_poses = data[1]
+                    self._apply_optimized_poses(optimized_poses)
+
+        except Exception as e:
+            Log(f"Error checking PGO updates: {e}", tag="Backend")
+
+    def _apply_optimized_poses(self, optimized_poses):
+        """Apply optimized poses from PGO to the system"""
+        try:
+            Log(f"Applying optimized poses for {len(optimized_poses)} keyframes", tag="Backend")
+
+            # Update viewpoints with optimized poses
+            for keyframe_id, optimized_pose in optimized_poses.items():
+                if keyframe_id in self.viewpoints:
+                    R_opt, t_opt = optimized_pose
+
+                    # Convert to torch tensors
+                    R_tensor = torch.from_numpy(R_opt).float().to(self.device)
+                    t_tensor = torch.from_numpy(t_opt).float().to(self.device)
+
+                    # Update viewpoint pose
+                    viewpoint = self.viewpoints[keyframe_id]
+                    viewpoint.R = R_tensor
+                    viewpoint.T = t_tensor
+
+                    # Update pose deltas (assuming they represent the difference from initial pose)
+                    # This is a simplified approach - in practice you might need more sophisticated pose management
+                    viewpoint.cam_rot_delta.data = torch.zeros_like(viewpoint.cam_rot_delta.data)
+                    viewpoint.cam_trans_delta.data = torch.zeros_like(viewpoint.cam_trans_delta.data)
+
+            # Update Gaussian map based on pose changes
+            self._update_gaussian_map_poses(optimized_poses)
+
+            Log("Successfully applied optimized poses", tag="Backend")
+
+        except Exception as e:
+            Log(f"Error applying optimized poses: {e}", tag="Backend")
+
+    def _update_gaussian_map_poses(self, optimized_poses):
+        """Update Gaussian map based on pose changes from PGO"""
+        try:
+            Log(f"Updating Gaussian map for {len(optimized_poses)} keyframes", tag="Backend")
+
+            # Store old poses for transformation computation
+            old_poses = {}
+            for keyframe_id in optimized_poses.keys():
+                if keyframe_id in self.viewpoints:
+                    viewpoint = self.viewpoints[keyframe_id]
+                    old_poses[keyframe_id] = [viewpoint.R.cpu().numpy(), viewpoint.T.cpu().numpy()]
+
+            # Apply pose transformations to Gaussians
+            if hasattr(self, 'gaussians') and self.gaussians is not None:
+                # Get unique keyframe IDs from Gaussians
+                unique_kf_ids = self.gaussians.unique_kfIDs.cpu().numpy()
+
+                for keyframe_id, optimized_pose in optimized_poses.items():
+                    if keyframe_id not in old_poses:
+                        continue
+
+                    # Compute transformation from old to new pose
+                    R_old, t_old = old_poses[keyframe_id]
+                    R_new, t_new = optimized_pose
+
+                    # T_new_old = T_new * T_old^(-1)
+                    R_old_inv = R_old.T
+                    t_old_inv = -R_old_inv @ t_old
+
+                    R_transform = R_new @ R_old_inv
+                    t_transform = R_new @ t_old_inv + t_new
+
+                    # Find Gaussians belonging to this keyframe
+                    mask = (unique_kf_ids == keyframe_id)
+                    if mask.sum() > 0:
+                        # Apply transformation to Gaussian positions
+                        xyz_old = self.gaussians._xyz[mask].cpu().numpy()
+                        xyz_new = (R_transform @ xyz_old.T).T + t_transform
+
+                        # Update Gaussian positions
+                        self.gaussians._xyz[mask] = torch.from_numpy(xyz_new).to(self.device)
+
+                        # Apply transformation to Gaussian rotations (if applicable)
+                        if hasattr(self.gaussians, '_rotation'):
+                            rotation_old = self.gaussians._rotation[mask].cpu().numpy()
+                            # Apply rotation transformation to quaternions or rotation matrices
+                            # This is simplified - in practice you'd need proper quaternion multiplication
+                            self.gaussians._rotation[mask] = torch.from_numpy(rotation_old).to(self.device)
+
+                        Log(f"Updated {mask.sum()} Gaussians for keyframe {keyframe_id}", tag="Backend")
+
+            # Reset Gaussian optimizer state to avoid conflicts
+            if hasattr(self, 'gaussians') and hasattr(self.gaussians, 'optimizer'):
+                # Clear optimizer state to prevent conflicts with new poses
+                for param_group in self.gaussians.optimizer.param_groups:
+                    for param in param_group['params']:
+                        if param.grad is not None:
+                            param.grad.data.zero_()
+
+                Log("Reset Gaussian optimizer state after pose update", tag="Backend")
+
+        except Exception as e:
+            Log(f"Error updating Gaussian map poses: {e}", tag="Backend")

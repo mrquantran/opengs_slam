@@ -26,7 +26,7 @@ class FrontEnd(mp.Process):
         self.q_main2vis = None
         self.q_vis2main = None
 
-        self.initialized = False            
+        self.initialized = False
         self.kf_indices = []
         self.monocular = config["Training"]["monocular"]
         self.iteration_count = 0
@@ -54,7 +54,7 @@ class FrontEnd(mp.Process):
         self.scale = 1                  # Scale factor computed using median, not enabled
         self.scale1 = 1                 # Scale factor computed using mean, used for scale correction
         self.theta = 0                  # Camera angle diff from last keyframe
-        
+
     def set_hyperparams(self):
         self.save_dir = self.config["Results"]["save_dir"]
         self.save_results = self.config["Results"]["save_results"]
@@ -64,8 +64,8 @@ class FrontEnd(mp.Process):
         self.tracking_itr_num = self.config["Training"]["tracking_itr_num"]
         self.kf_interval = self.config["Training"]["kf_interval"]
         self.window_size = self.config["Training"]["window_size"]
-        self.single_thread = self.config["Training"]["single_thread"]      
-        
+        self.single_thread = self.config["Training"]["single_thread"]
+
     def add_new_keyframe(self, cur_frame_idx, depth=None, opacity=None, init=False):
         rgb_boundary_threshold = self.config["Training"]["rgb_boundary_threshold"]
         if len(self.kf_indices) > 0:
@@ -87,16 +87,16 @@ class FrontEnd(mp.Process):
         # print("angle diff is:",self.theta)
         ### MonoGS Gaussian init depth, not used
         gt_img = viewpoint.original_image.cuda()
-        valid_rgb = (gt_img.sum(dim=0) > rgb_boundary_threshold)[None]    
+        valid_rgb = (gt_img.sum(dim=0) > rgb_boundary_threshold)[None]
         if self.monocular:
             if depth is None:
-                initial_depth = 2 * torch.ones(1, gt_img.shape[1], gt_img.shape[2]) 
-                initial_depth += torch.randn_like(initial_depth) * 0.3            
-            else:      
+                initial_depth = 2 * torch.ones(1, gt_img.shape[1], gt_img.shape[2])
+                initial_depth += torch.randn_like(initial_depth) * 0.3
+            else:
                 depth = depth.detach().clone()
                 opacity = opacity.detach()
                 use_inv_depth = False
-                if use_inv_depth:   
+                if use_inv_depth:
                     inv_depth = 1.0 / depth
                     inv_median_depth, inv_std, valid_mask = get_median_depth(
                         inv_depth, opacity, mask=valid_rgb, return_std=True
@@ -125,13 +125,13 @@ class FrontEnd(mp.Process):
                     )
                     depth[invalid_depth_mask] = median_depth
                     initial_depth = depth + torch.randn_like(depth) * torch.where(
-                        invalid_depth_mask, std * 0.5, std * 0.2     
+                        invalid_depth_mask, std * 0.5, std * 0.2
                     )
 
-                initial_depth[~valid_rgb] = 0 
+                initial_depth[~valid_rgb] = 0
             return initial_depth.cpu().numpy()[0]
 
-        initial_depth = torch.from_numpy(viewpoint.depth).unsqueeze(0)      
+        initial_depth = torch.from_numpy(viewpoint.depth).unsqueeze(0)
         initial_depth[~valid_rgb.cpu()] = 0  # Ignore the invalid rgb pixels
         return initial_depth[0].numpy()      # (C, H, W), not used!
 
@@ -150,9 +150,9 @@ class FrontEnd(mp.Process):
 
         self.kf_indices = []
         depth_map = self.add_new_keyframe(cur_frame_idx, init=True)
-        self.request_init(cur_frame_idx, viewpoint, depth_map)      
+        self.request_init(cur_frame_idx, viewpoint, depth_map)
         self.reset = False
-    
+
     def tracking(self, cur_frame_idx, viewpoint):
         prev = self.cameras[cur_frame_idx - self.use_every_n_frames]
         # Get relative pose, pointcloud, and point matching correspondence
@@ -173,7 +173,7 @@ class FrontEnd(mp.Process):
         w2c2 = trans_pose_inv_torch @ w2c1
         viewpoint.update_RT(w2c2[:3,:3],w2c2[:3,3])         # Compute current frame pose estimation using relative pose
         # pose optimization
-        opt_params = []     
+        opt_params = []
         opt_params.append(
             {
                 "params": [viewpoint.cam_rot_delta],
@@ -221,9 +221,9 @@ class FrontEnd(mp.Process):
 
             with torch.no_grad():
                 pose_optimizer.step()
-                converged = update_pose(viewpoint) 
+                converged = update_pose(viewpoint)
 
-            if tracking_itr % 10 == 0:             
+            if tracking_itr % 10 == 0:
                 self.q_main2vis.put(
                     gui_utils.GaussianPacket(
                         current_frame=viewpoint,
@@ -235,7 +235,7 @@ class FrontEnd(mp.Process):
                 )
             if converged:
                 break
-            
+
         ## Print camera pose change and scale factor
         #c2w1 = torch.linalg.inv(w2c1)
         #c2w2 = torch.linalg.inv(w2c2)
@@ -246,10 +246,10 @@ class FrontEnd(mp.Process):
         #print("Cumulative mean scale factor:", self.scale1)
         #print("Current frame median scale:",scale)
         #print("Cumulative median scale factor:", self.scale)
-        
+
         self.median_depth = get_median_depth(depth, opacity)    # Median rendered depth for keyframe determination
         return render_pkg
-    
+
     def is_keyframe(
         self,
         cur_frame_idx,
@@ -263,10 +263,10 @@ class FrontEnd(mp.Process):
 
         curr_frame = self.cameras[cur_frame_idx]
         last_kf = self.cameras[last_keyframe_idx]
-        pose_CW = getWorld2View2(curr_frame.R, curr_frame.T)        
+        pose_CW = getWorld2View2(curr_frame.R, curr_frame.T)
         last_kf_CW = getWorld2View2(last_kf.R, last_kf.T)
-        last_kf_WC = torch.linalg.inv(last_kf_CW)                   
-        dist = torch.norm((pose_CW @ last_kf_WC)[0:3, 3])        
+        last_kf_WC = torch.linalg.inv(last_kf_CW)
+        dist = torch.norm((pose_CW @ last_kf_WC)[0:3, 3])
         dist_check = dist > kf_translation * self.median_depth
         dist_check2 = dist > kf_min_translation * self.median_depth
 
@@ -277,8 +277,8 @@ class FrontEnd(mp.Process):
             cur_frame_visibility_filter, occ_aware_visibility[last_keyframe_idx]
         ).count_nonzero()
         point_ratio_2 = intersection / union
-        return (point_ratio_2 < kf_overlap and dist_check2) or dist_check       
-    
+        return (point_ratio_2 < kf_overlap and dist_check2) or dist_check
+
     def add_to_window(
         self, cur_frame_idx, cur_frame_visibility_filter, occ_aware_visibility, window
     ):
@@ -306,7 +306,7 @@ class FrontEnd(mp.Process):
             )
             if not self.initialized:
                 cut_off = 0.4
-            if point_ratio_2 <= cut_off:        
+            if point_ratio_2 <= cut_off:
                 to_remove.append(kf_idx)
         # Remove earliest keyframe with overlap below threshold
         if to_remove:
@@ -343,7 +343,36 @@ class FrontEnd(mp.Process):
     ### Exchange info with backend via following functions
     # Request new keyframe; enqueue related info to backend
     def request_keyframe(self, cur_frame_idx, viewpoint, current_window, depthmap):
-        msg = ["keyframe", cur_frame_idx, viewpoint, current_window, depthmap, self.pts3d, self.imgs, self.mask, self.scale1, self.theta]
+        # Get RGB image for PGO landmark detection
+        try:
+            # Convert to numpy and ensure correct format (HxWx3)
+            rgb_image = viewpoint.original_image.cpu().numpy()
+
+            # Ensure image is in correct format
+            if len(rgb_image.shape) == 3:
+                # If image is in CxHxW format, transpose to HxWxC
+                if rgb_image.shape[0] == 3:
+                    rgb_image = rgb_image.transpose(1, 2, 0)
+                # If already in HxWxC format, ensure it's uint8
+                elif rgb_image.shape[2] == 3:
+                    # Convert to uint8 if needed
+                    if rgb_image.dtype != np.uint8:
+                        if rgb_image.max() <= 1.0:
+                            rgb_image = (rgb_image * 255).astype(np.uint8)
+                        else:
+                            rgb_image = rgb_image.astype(np.uint8)
+                else:
+                    # Invalid format, skip PGO
+                    rgb_image = None
+            else:
+                # Invalid shape, skip PGO
+                rgb_image = None
+
+        except Exception as e:
+            print(f"Error processing RGB image for PGO: {e}")
+            rgb_image = None
+
+        msg = ["keyframe", cur_frame_idx, viewpoint, current_window, depthmap, self.pts3d, self.imgs, self.mask, self.scale1, self.theta, rgb_image]
         self.backend_queue.put(msg)
         self.requested_keyframe += 1
     # Request initialization; enqueue related info to backend.
@@ -365,12 +394,12 @@ class FrontEnd(mp.Process):
         self.cameras[cur_frame_idx].clean()
         if cur_frame_idx % 10 == 0:
             torch.cuda.empty_cache()
-            
+
     # Main loop: process messages in frontend and backend queues; perform tracking, keyframe management;
     # synchronize data, clean up resources, and save results
     def run(self):
         cur_frame_idx = 0
-        projection_matrix = getProjectionMatrix2(       
+        projection_matrix = getProjectionMatrix2(
             znear=0.01,
             zfar=100.0,
             fx=self.dataset.fx,
@@ -381,11 +410,11 @@ class FrontEnd(mp.Process):
             H=self.dataset.height,
         ).transpose(0, 1)
         projection_matrix = projection_matrix.to(device=self.device)
-        tic = torch.cuda.Event(enable_timing=True)      
+        tic = torch.cuda.Event(enable_timing=True)
         toc = torch.cuda.Event(enable_timing=True)
 
         while True:
-            if self.q_vis2main.empty():        
+            if self.q_vis2main.empty():
                 if self.pause:
                     continue
             else:
@@ -413,7 +442,7 @@ class FrontEnd(mp.Process):
                             self.gaussians, self.save_dir, "final", final=True
                         )
                     break
-              
+
                 if self.requested_init:
                     time.sleep(0.01)
                     continue
@@ -425,19 +454,19 @@ class FrontEnd(mp.Process):
                 if not self.initialized and self.requested_keyframe > 0:
                     time.sleep(0.01)
                     continue
-                
+
                 viewpoint = Camera.init_from_dataset(
                     self.dataset, cur_frame_idx, projection_matrix
                 )
                 viewpoint.compute_grad_mask(self.config)
 
                 self.cameras[cur_frame_idx] = viewpoint
-        
+
                 if self.reset:
                     self.last_color = self.cameras[cur_frame_idx].original_image
                     _ ,pts3d, imgs, self.matches_im0, self.matches_im1, self.matches_3d0=get_result(self.last_color,self.last_color, model=self.d3r_model, device=self.device)
                     self.pts3d = pts3d
-                    self.imgs = imgs 
+                    self.imgs = imgs
                     self.initialize(cur_frame_idx, viewpoint)
                     self.current_window.append(cur_frame_idx)
                     cur_frame_idx += 1
@@ -450,11 +479,11 @@ class FrontEnd(mp.Process):
                 # Tracking
                 render_pkg = self.tracking(cur_frame_idx, viewpoint)
                 self.last_color = self.cameras[cur_frame_idx].original_image
-    
+
                 current_window_dict = {}
                 current_window_dict[self.current_window[0]] = self.current_window[1:]
                 keyframes = [self.cameras[kf_idx] for kf_idx in self.current_window]
-                
+
                 self.q_main2vis.put(
                     gui_utils.GaussianPacket(
                         gaussians=clone_obj(self.gaussians),
@@ -463,20 +492,20 @@ class FrontEnd(mp.Process):
                         kf_window=current_window_dict,
                     )
                 )
-                
+
                 if self.requested_keyframe > 0:
                     self.cleanup(cur_frame_idx)
                     cur_frame_idx += 1
                     continue
 
                 last_keyframe_idx = self.current_window[0]
-                check_time = (cur_frame_idx - last_keyframe_idx) >= self.kf_interval    
+                check_time = (cur_frame_idx - last_keyframe_idx) >= self.kf_interval
                 curr_visibility = (render_pkg["n_touched"] > 0).long()
                 create_kf = self.is_keyframe(
                     cur_frame_idx,
                     last_keyframe_idx,
                     curr_visibility,
-                    self.occ_aware_visibility,        
+                    self.occ_aware_visibility,
                 )
                 if len(self.current_window) < self.window_size:
                     union = torch.logical_or(
@@ -490,28 +519,28 @@ class FrontEnd(mp.Process):
                         check_time
                         and point_ratio < self.config["Training"]["kf_overlap"]
                     )
-                if self.single_thread:      
+                if self.single_thread:
                     create_kf = check_time and create_kf
-                if create_kf:       
+                if create_kf:
                     self.current_window, removed = self.add_to_window(
                         cur_frame_idx,
                         curr_visibility,
                         self.occ_aware_visibility,
                         self.current_window,
-                    )       
-                    depth_map = self.add_new_keyframe(      
+                    )
+                    depth_map = self.add_new_keyframe(
                         cur_frame_idx,
                         depth=render_pkg["depth"],
                         opacity=render_pkg["opacity"],
                         init=False,
                     )
                     Log("new keyframe: ", cur_frame_idx)
-                    self.request_keyframe(   
+                    self.request_keyframe(
                         cur_frame_idx, viewpoint, self.current_window, depth_map
                     )
                 else:
                     self.cleanup(cur_frame_idx)
-                cur_frame_idx += 1              
+                cur_frame_idx += 1
 
                 if (                    # Perform trajectory evaluation when certain conditions are met
                     self.save_results
@@ -528,7 +557,7 @@ class FrontEnd(mp.Process):
                         monocular=self.monocular,
                     )
                 toc.record()
-                torch.cuda.synchronize()      
+                torch.cuda.synchronize()
                 if create_kf:
                     duration = tic.elapsed_time(toc)
                     time.sleep(max(0.01, 1.0 / 3.0 - duration / 1000))
