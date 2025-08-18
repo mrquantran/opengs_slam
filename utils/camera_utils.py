@@ -4,7 +4,6 @@ from torch import nn
 from gaussian_splatting.utils.graphics_utils import getProjectionMatrix2, getWorld2View2
 from utils.slam_utils import image_gradient, image_gradient_mask
 
-
 class Camera(nn.Module):
     def __init__(
         self,
@@ -36,6 +35,11 @@ class Camera(nn.Module):
         self.original_image = color
         self.depth = depth
         self.grad_mask = None
+
+        image_rgb_for_gray = self.original_image.to(self.device)
+        self.original_image_gray = (0.299 * image_rgb_for_gray[0] +
+                                    0.587 * image_rgb_for_gray[1] +
+                                    0.114 * image_rgb_for_gray[2]).unsqueeze(0)
 
         self.fx = fx
         self.fy = fy
@@ -82,6 +86,25 @@ class Camera(nn.Module):
             device=dataset.device,
         )
 
+    def get_image(self):
+        return self.original_image.cuda(), self.original_image_gray.cuda()
+
+    def get_k(self, scale=1.0):
+        K = torch.tensor([[self.fx / scale, 0, self.cx / scale],
+                        [0, self.fy / scale, self.cy / scale],
+                        [0, 0, 1]], device=self.device, dtype=torch.float32)
+        return K
+
+    def get_rays(self, scale=1.0):
+        W, H = int(self.image_width/scale), int(self.image_height/scale)
+        ix, iy = torch.meshgrid(
+            torch.arange(W), torch.arange(H), indexing='xy')
+        rays_d = torch.stack(
+                    [(ix-self.cx/scale) / self.fx * scale,
+                    (iy-self.cy/scale) / self.fy * scale,
+                    torch.ones_like(ix)], -1).float().cuda()
+        return rays_d
+
     @staticmethod
     def init_from_gui(uid, T, FoVx, FoVy, fx, fy, cx, cy, H, W):
         projection_matrix = getProjectionMatrix2(
@@ -121,7 +144,7 @@ class Camera(nn.Module):
         gray_grad_h = gray_grad_h * mask_h
         img_grad_intensity = torch.sqrt(gray_grad_v**2 + gray_grad_h**2)
 
-        if config["Dataset"]["type"] == "replica":      
+        if config["Dataset"]["type"] == "replica":
             row, col = 32, 32
             multiplier = edge_threshold
             _, h, w = self.original_image.shape

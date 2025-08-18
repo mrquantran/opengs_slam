@@ -1,8 +1,10 @@
 import time
+import math
 
 import numpy as np
 import torch
 import torch.multiprocessing as mp
+import torch.nn.functional as F
 
 from gaussian_splatting.gaussian_renderer import render
 from gaussian_splatting.utils.graphics_utils import getProjectionMatrix2, getWorld2View2
@@ -15,6 +17,90 @@ from utils.pose_utils import update_pose
 from utils.slam_utils import get_loss_tracking, get_median_depth
 from utils.dust3r_utils import get_result, get_scale
 
+def patch_offsets(h_patch_size, device):
+    offsets = torch.arange(-h_patch_size, h_patch_size + 1, device=device)
+    return torch.stack(torch.meshgrid(offsets, offsets, indexing='xy')[::-1], dim=-1).view(1, -1, 2)
+
+def patch_warp(H, uv):
+    B, P = uv.shape[:2]
+    H = H.view(B, 3, 3)
+    ones = torch.ones((B,P,1), device=uv.device)
+    homo_uv = torch.cat((uv, ones), dim=-1)
+
+    grid_tmp = torch.einsum("bik,bpk->bpi", H, homo_uv)
+    grid_tmp = grid_tmp.reshape(B, P, 3)
+    grid = grid_tmp[..., :2] / (grid_tmp[..., 2:] + 1e-10)
+    return grid
+
+def lncc(ref, nea):
+    # ref_gray: [batch_size, total_patch_size]
+    # nea_grays: [batch_size, total_patch_size]
+    bs, tps = nea.shape
+    patch_size = int(np.sqrt(tps))
+
+    ref_nea = ref * nea
+    ref_nea = ref_nea.view(bs, 1, patch_size, patch_size)
+    ref = ref.view(bs, 1, patch_size, patch_size)
+    nea = nea.view(bs, 1, patch_size, patch_size)
+    ref2 = ref.pow(2)
+    nea2 = nea.pow(2)
+
+    # sum over kernel
+    filters = torch.ones(1, 1, patch_size, patch_size, device=ref.device)
+    padding = patch_size // 2
+    ref_sum = F.conv2d(ref, filters, stride=1, padding=padding)[:, :, padding, padding]
+    nea_sum = F.conv2d(nea, filters, stride=1, padding=padding)[:, :, padding, padding]
+    ref2_sum = F.conv2d(ref2, filters, stride=1, padding=padding)[:, :, padding, padding]
+    nea2_sum = F.conv2d(nea2, filters, stride=1, padding=padding)[:, :, padding, padding]
+    ref_nea_sum = F.conv2d(ref_nea, filters, stride=1, padding=padding)[:, :, padding, padding]
+
+    # average over kernel
+    ref_avg = ref_sum / tps
+    nea_avg = nea_sum / tps
+
+    cross = ref_nea_sum - nea_avg * ref_sum
+    ref_var = ref2_sum - ref_avg * ref_sum
+    nea_var = nea2_sum - nea_avg * nea_sum
+
+    cc = cross * cross / (ref_var * nea_var + 1e-8)
+    ncc = 1 - cc
+    ncc = torch.clamp(ncc, 0.0, 2.0)
+    ncc = torch.mean(ncc, dim=1, keepdim=True)
+    mask = (ncc < 0.9)
+    return ncc, mask
+
+def depths_to_points(view, depthmap):
+    # c2w = (view.world_view_transform.T).inverse()
+    # we train in camera coordinate
+    c2w = torch.eye(4).float().cuda()
+    W, H = view.image_width, view.image_height
+    fx = W / (2 * math.tan(view.FoVx / 2.))
+    fy = H / (2 * math.tan(view.FoVy / 2.))
+    intrins = torch.tensor(
+        [[fx, 0., W/2.],
+        [0., fy, H/2.],
+        [0., 0., 1.0]]
+    ).float().cuda()
+    grid_x, grid_y = torch.meshgrid(torch.arange(W)+0.5, torch.arange(H)+0.5, indexing='xy')
+    points = torch.stack([grid_x, grid_y, torch.ones_like(grid_x)], dim=-1).reshape(-1, 3).float().cuda()
+    rays_d = points @ intrins.inverse().T @ c2w[:3,:3].T
+    rays_o = c2w[:3,3]
+    points = depthmap.reshape(-1, 1) * rays_d + rays_o
+    return points
+
+def depth_to_normal(view, depth):
+    """
+        view: view camera
+        depth: depthmap
+    """
+    points = depths_to_points(view, depth).reshape(*depth.shape[1:], 3)
+    output = torch.zeros_like(points)
+    dx = torch.cat([points[2:, 1:-1] - points[:-2, 1:-1]], dim=0)
+    dy = torch.cat([points[1:-1, 2:] - points[1:-1, :-2]], dim=1)
+    normal_map = torch.nn.functional.normalize(torch.cross(dx, dy, dim=-1), dim=-1)
+    output[1:-1, 1:-1, :] = normal_map
+    return output, points
+
 class FrontEnd(mp.Process):
     def __init__(self, config, d3r_model):
         super().__init__()
@@ -26,7 +112,7 @@ class FrontEnd(mp.Process):
         self.q_main2vis = None
         self.q_vis2main = None
 
-        self.initialized = False            
+        self.initialized = False
         self.kf_indices = []
         self.monocular = config["Training"]["monocular"]
         self.iteration_count = 0
@@ -54,7 +140,7 @@ class FrontEnd(mp.Process):
         self.scale = 1                  # Scale factor computed using median, not enabled
         self.scale1 = 1                 # Scale factor computed using mean, used for scale correction
         self.theta = 0                  # Camera angle diff from last keyframe
-        
+
     def set_hyperparams(self):
         self.save_dir = self.config["Results"]["save_dir"]
         self.save_results = self.config["Results"]["save_results"]
@@ -64,8 +150,8 @@ class FrontEnd(mp.Process):
         self.tracking_itr_num = self.config["Training"]["tracking_itr_num"]
         self.kf_interval = self.config["Training"]["kf_interval"]
         self.window_size = self.config["Training"]["window_size"]
-        self.single_thread = self.config["Training"]["single_thread"]      
-        
+        self.single_thread = self.config["Training"]["single_thread"]
+
     def add_new_keyframe(self, cur_frame_idx, depth=None, opacity=None, init=False):
         rgb_boundary_threshold = self.config["Training"]["rgb_boundary_threshold"]
         if len(self.kf_indices) > 0:
@@ -87,16 +173,16 @@ class FrontEnd(mp.Process):
         # print("angle diff is:",self.theta)
         ### MonoGS Gaussian init depth, not used
         gt_img = viewpoint.original_image.cuda()
-        valid_rgb = (gt_img.sum(dim=0) > rgb_boundary_threshold)[None]    
+        valid_rgb = (gt_img.sum(dim=0) > rgb_boundary_threshold)[None]
         if self.monocular:
             if depth is None:
-                initial_depth = 2 * torch.ones(1, gt_img.shape[1], gt_img.shape[2]) 
-                initial_depth += torch.randn_like(initial_depth) * 0.3            
-            else:      
+                initial_depth = 2 * torch.ones(1, gt_img.shape[1], gt_img.shape[2])
+                initial_depth += torch.randn_like(initial_depth) * 0.3
+            else:
                 depth = depth.detach().clone()
                 opacity = opacity.detach()
                 use_inv_depth = False
-                if use_inv_depth:   
+                if use_inv_depth:
                     inv_depth = 1.0 / depth
                     inv_median_depth, inv_std, valid_mask = get_median_depth(
                         inv_depth, opacity, mask=valid_rgb, return_std=True
@@ -125,13 +211,13 @@ class FrontEnd(mp.Process):
                     )
                     depth[invalid_depth_mask] = median_depth
                     initial_depth = depth + torch.randn_like(depth) * torch.where(
-                        invalid_depth_mask, std * 0.5, std * 0.2     
+                        invalid_depth_mask, std * 0.5, std * 0.2
                     )
 
-                initial_depth[~valid_rgb] = 0 
+                initial_depth[~valid_rgb] = 0
             return initial_depth.cpu().numpy()[0]
 
-        initial_depth = torch.from_numpy(viewpoint.depth).unsqueeze(0)      
+        initial_depth = torch.from_numpy(viewpoint.depth).unsqueeze(0)
         initial_depth[~valid_rgb.cpu()] = 0  # Ignore the invalid rgb pixels
         return initial_depth[0].numpy()      # (C, H, W), not used!
 
@@ -150,9 +236,43 @@ class FrontEnd(mp.Process):
 
         self.kf_indices = []
         depth_map = self.add_new_keyframe(cur_frame_idx, init=True)
-        self.request_init(cur_frame_idx, viewpoint, depth_map)      
+        self.request_init(cur_frame_idx, viewpoint, depth_map)
         self.reset = False
-    
+
+    def find_nearest_keyframe(self, current_viewpoint, window_indices):
+        """
+        Finds the keyframe in the current window that is closest in position
+        to the current viewpoint.
+        """
+        # 1. Kiểm tra điều kiện biên
+        if len(window_indices) <= 1:
+            return None
+
+        # 2. Lấy vị trí camera hiện tại
+        current_pos = current_viewpoint.camera_center
+
+        best_kf_idx = -1
+        min_dist = float('inf')
+
+        # 3. Duyệt qua các keyframe trong cửa sổ
+        # We iterate starting from the second keyframe in the window,
+        # as the first one is the newest one (which might be the current frame itself
+        # if it becomes a keyframe, or the one right before it).
+        for kf_idx in window_indices[1:]:
+            keyframe_cam = self.cameras.get(kf_idx)
+            if keyframe_cam:
+                kf_pos = keyframe_cam.camera_center
+                dist = torch.norm(current_pos - kf_pos)
+                if dist < min_dist:
+                    min_dist = dist
+                    best_kf_idx = kf_idx
+
+        # 4. Trả về kết quả
+        if best_kf_idx != -1:
+            return self.cameras.get(best_kf_idx)
+        else:
+            return None
+
     def tracking(self, cur_frame_idx, viewpoint):
         prev = self.cameras[cur_frame_idx - self.use_every_n_frames]
         # Get relative pose, pointcloud, and point matching correspondence
@@ -173,7 +293,7 @@ class FrontEnd(mp.Process):
         w2c2 = trans_pose_inv_torch @ w2c1
         viewpoint.update_RT(w2c2[:3,:3],w2c2[:3,3])         # Compute current frame pose estimation using relative pose
         # pose optimization
-        opt_params = []     
+        opt_params = []
         opt_params.append(
             {
                 "params": [viewpoint.cam_rot_delta],
@@ -204,6 +324,9 @@ class FrontEnd(mp.Process):
         )
 
         pose_optimizer = torch.optim.Adam(opt_params)
+
+        nearest_cam = self.find_nearest_keyframe(viewpoint, self.current_window)
+
         for tracking_itr in range(self.tracking_itr_num):
             render_pkg = render(
                 viewpoint, self.gaussians, self.pipeline_params, self.background
@@ -217,13 +340,110 @@ class FrontEnd(mp.Process):
             loss_tracking = get_loss_tracking(
                 self.config, image, depth, opacity, viewpoint
             )
-            loss_tracking.backward()
+
+            ncc_loss = torch.tensor(0.0, device=self.device)
+            if nearest_cam is not None:
+                # 1. Lấy thông tin cần thiết từ render_pkg
+                # Giả sử rasterizer trả về 'normal'. Nếu không, ta cần tính nó.
+                # rendered_normal = render_pkg.get("normal")
+                # if rendered_normal is None:
+
+                rendered_normal, _ = depth_to_normal(viewpoint, depth.unsqueeze(0))
+                rendered_normal = rendered_normal.squeeze(0).permute(2, 0, 1) # Chuyển về (C, H, W)
+
+                # 2. Lấy mẫu pixel và tính toán consistency
+                patch_size = 3 # Lấy từ config hoặc hardcode
+                sample_num = 102400 # Lấy từ config hoặc hardcode
+                H, W = depth.shape[-2:]
+
+                # Ưu tiên lấy mẫu ở vùng có gradient cao để NCC hiệu quả hơn
+                valid_pixels_mask = (depth > 0).squeeze()
+                high_grad_mask = viewpoint.grad_mask.squeeze() > 0
+                final_sampling_mask = valid_pixels_mask & high_grad_mask
+
+                valid_indices = torch.where(final_sampling_mask.view(-1))[0]
+
+                if valid_indices.numel() > sample_num:
+                    sampled_indices = valid_indices[torch.randperm(valid_indices.numel(), device=self.device)[:sample_num]]
+                else:
+                    sampled_indices = valid_indices
+
+                if sampled_indices.numel() > 0:
+                    # --- B. Tính Homography (Differentiable) ---
+                    # Chuyển chỉ số 1D thành tọa độ 2D
+                    sampled_pixels_y = sampled_indices // W
+                    sampled_pixels_x = sampled_indices % W
+                    sampled_pixels = torch.stack((sampled_pixels_x, sampled_pixels_y), dim=-1).float()
+
+                    # Lấy normal tại các điểm đã lấy mẫu
+                    ref_local_n = rendered_normal.permute(1, 2, 0).reshape(-1, 3)[sampled_indices]
+
+                    # Tính Plane Distance `d`
+                    rays_d = viewpoint.get_rays()
+                    rendered_normal_flat = rendered_normal.permute(1, 2, 0).reshape(-1, 3)
+                    plane_distance = depth.reshape(-1) * torch.abs((rendered_normal_flat * rays_d.reshape(-1, 3)).sum(dim=-1))
+                    ref_local_d = plane_distance[sampled_indices]
+
+                    # Ma trận extrinsic tương đối
+                    ref_to_nearest_w2c = nearest_cam.world_view_transform.T @ torch.linalg.inv(viewpoint.world_view_transform.T)
+                    ref_to_nearest_r = ref_to_nearest_w2c[:3, :3]
+                    ref_to_nearest_t = ref_to_nearest_w2c[:3, 3]
+
+                    # Công thức Homography H = K_n * (R - t*n^T/d) * K_r^{-1}
+                    H_ref_to_neareast = ref_to_nearest_r[None] - \
+                        (ref_to_nearest_t[None, :, None] @ ref_local_n[:, None, :]) / (ref_local_d[:, None, None] + 1e-8)
+
+                    # Áp dụng ma trận nội suy
+                    K_ref_inv = torch.linalg.inv(viewpoint.get_k())
+                    K_nea = nearest_cam.get_k()
+                    H_ref_to_neareast = (K_nea @ H_ref_to_neareast) @ K_ref_inv
+
+                    # --- C. Warp Patches và Tính NCC Loss ---
+                    h_patch_size = (patch_size - 1) // 2
+                    offsets = patch_offsets(h_patch_size, self.device)
+                    ref_pixels_patch = sampled_pixels.reshape(-1, 1, 2) + offsets.float()
+
+                    # Lấy patch từ ảnh GT của view hiện tại
+                    _, ref_image_gray = viewpoint.get_image()
+
+                    ref_pixels_patch_norm = ref_pixels_patch.clone()
+                    ref_pixels_patch_norm[..., 0] = (ref_pixels_patch_norm[..., 0] / (W - 1)) * 2 - 1
+                    ref_pixels_patch_norm[..., 1] = (ref_pixels_patch_norm[..., 1] / (H - 1)) * 2 - 1
+                    ref_gray_val = F.grid_sample(
+                        ref_image_gray.unsqueeze(0),
+                        ref_pixels_patch_norm.unsqueeze(0),
+                        align_corners=True
+                    ).squeeze(0).squeeze(0).view(-1, patch_size**2)
+
+                    # Warp tọa độ và lấy patch từ ảnh GT của view lân cận
+                    nea_pixels_patch = patch_warp(H_ref_to_neareast, ref_pixels_patch)
+                    _, nea_image_gray = nearest_cam.get_image()
+
+                    nea_pixels_patch_norm = nea_pixels_patch.clone()
+                    nea_pixels_patch_norm[..., 0] = (nea_pixels_patch_norm[..., 0] / (W - 1)) * 2 - 1
+                    nea_pixels_patch_norm[..., 1] = (nea_pixels_patch_norm[..., 1] / (H - 1)) * 2 - 1
+                    nea_gray_val = F.grid_sample(
+                        nea_image_gray.unsqueeze(0),
+                        nea_pixels_patch_norm.unsqueeze(0),
+                        align_corners=True
+                    ).squeeze(0).squeeze(0).view(-1, patch_size**2)
+
+                    # Tính NCC loss
+                    ncc_val, _ = lncc(ref_gray_val, nea_gray_val)
+                    ncc_loss = ncc_val.mean()
+
+            # 4. TỔNG HỢP LOSS VÀ BACKPROPAGATION
+            lambda_photo_mv = 0.15 # Nên lấy từ config
+            print(f"\rNCC Loss: {ncc_loss.item():.6f}", end="", flush=True)
+
+            total_loss = loss_tracking + lambda_photo_mv * ncc_loss
+            total_loss.backward()
 
             with torch.no_grad():
                 pose_optimizer.step()
-                converged = update_pose(viewpoint) 
+                converged = update_pose(viewpoint)
 
-            if tracking_itr % 10 == 0:             
+            if tracking_itr % 10 == 0:
                 self.q_main2vis.put(
                     gui_utils.GaussianPacket(
                         current_frame=viewpoint,
@@ -235,7 +455,7 @@ class FrontEnd(mp.Process):
                 )
             if converged:
                 break
-            
+
         ## Print camera pose change and scale factor
         #c2w1 = torch.linalg.inv(w2c1)
         #c2w2 = torch.linalg.inv(w2c2)
@@ -246,10 +466,10 @@ class FrontEnd(mp.Process):
         #print("Cumulative mean scale factor:", self.scale1)
         #print("Current frame median scale:",scale)
         #print("Cumulative median scale factor:", self.scale)
-        
+
         self.median_depth = get_median_depth(depth, opacity)    # Median rendered depth for keyframe determination
         return render_pkg
-    
+
     def is_keyframe(
         self,
         cur_frame_idx,
@@ -263,10 +483,10 @@ class FrontEnd(mp.Process):
 
         curr_frame = self.cameras[cur_frame_idx]
         last_kf = self.cameras[last_keyframe_idx]
-        pose_CW = getWorld2View2(curr_frame.R, curr_frame.T)        
+        pose_CW = getWorld2View2(curr_frame.R, curr_frame.T)
         last_kf_CW = getWorld2View2(last_kf.R, last_kf.T)
-        last_kf_WC = torch.linalg.inv(last_kf_CW)                   
-        dist = torch.norm((pose_CW @ last_kf_WC)[0:3, 3])        
+        last_kf_WC = torch.linalg.inv(last_kf_CW)
+        dist = torch.norm((pose_CW @ last_kf_WC)[0:3, 3])
         dist_check = dist > kf_translation * self.median_depth
         dist_check2 = dist > kf_min_translation * self.median_depth
 
@@ -277,8 +497,8 @@ class FrontEnd(mp.Process):
             cur_frame_visibility_filter, occ_aware_visibility[last_keyframe_idx]
         ).count_nonzero()
         point_ratio_2 = intersection / union
-        return (point_ratio_2 < kf_overlap and dist_check2) or dist_check       
-    
+        return (point_ratio_2 < kf_overlap and dist_check2) or dist_check
+
     def add_to_window(
         self, cur_frame_idx, cur_frame_visibility_filter, occ_aware_visibility, window
     ):
@@ -306,7 +526,7 @@ class FrontEnd(mp.Process):
             )
             if not self.initialized:
                 cut_off = 0.4
-            if point_ratio_2 <= cut_off:        
+            if point_ratio_2 <= cut_off:
                 to_remove.append(kf_idx)
         # Remove earliest keyframe with overlap below threshold
         if to_remove:
@@ -365,12 +585,12 @@ class FrontEnd(mp.Process):
         self.cameras[cur_frame_idx].clean()
         if cur_frame_idx % 10 == 0:
             torch.cuda.empty_cache()
-            
+
     # Main loop: process messages in frontend and backend queues; perform tracking, keyframe management;
     # synchronize data, clean up resources, and save results
     def run(self):
         cur_frame_idx = 0
-        projection_matrix = getProjectionMatrix2(       
+        projection_matrix = getProjectionMatrix2(
             znear=0.01,
             zfar=100.0,
             fx=self.dataset.fx,
@@ -381,11 +601,11 @@ class FrontEnd(mp.Process):
             H=self.dataset.height,
         ).transpose(0, 1)
         projection_matrix = projection_matrix.to(device=self.device)
-        tic = torch.cuda.Event(enable_timing=True)      
+        tic = torch.cuda.Event(enable_timing=True)
         toc = torch.cuda.Event(enable_timing=True)
 
         while True:
-            if self.q_vis2main.empty():        
+            if self.q_vis2main.empty():
                 if self.pause:
                     continue
             else:
@@ -413,7 +633,7 @@ class FrontEnd(mp.Process):
                             self.gaussians, self.save_dir, "final", final=True
                         )
                     break
-              
+
                 if self.requested_init:
                     time.sleep(0.01)
                     continue
@@ -425,19 +645,19 @@ class FrontEnd(mp.Process):
                 if not self.initialized and self.requested_keyframe > 0:
                     time.sleep(0.01)
                     continue
-                
+
                 viewpoint = Camera.init_from_dataset(
                     self.dataset, cur_frame_idx, projection_matrix
                 )
                 viewpoint.compute_grad_mask(self.config)
 
                 self.cameras[cur_frame_idx] = viewpoint
-        
+
                 if self.reset:
                     self.last_color = self.cameras[cur_frame_idx].original_image
                     _ ,pts3d, imgs, self.matches_im0, self.matches_im1, self.matches_3d0=get_result(self.last_color,self.last_color, model=self.d3r_model, device=self.device)
                     self.pts3d = pts3d
-                    self.imgs = imgs 
+                    self.imgs = imgs
                     self.initialize(cur_frame_idx, viewpoint)
                     self.current_window.append(cur_frame_idx)
                     cur_frame_idx += 1
@@ -450,11 +670,11 @@ class FrontEnd(mp.Process):
                 # Tracking
                 render_pkg = self.tracking(cur_frame_idx, viewpoint)
                 self.last_color = self.cameras[cur_frame_idx].original_image
-    
+
                 current_window_dict = {}
                 current_window_dict[self.current_window[0]] = self.current_window[1:]
                 keyframes = [self.cameras[kf_idx] for kf_idx in self.current_window]
-                
+
                 self.q_main2vis.put(
                     gui_utils.GaussianPacket(
                         gaussians=clone_obj(self.gaussians),
@@ -463,20 +683,20 @@ class FrontEnd(mp.Process):
                         kf_window=current_window_dict,
                     )
                 )
-                
+
                 if self.requested_keyframe > 0:
                     self.cleanup(cur_frame_idx)
                     cur_frame_idx += 1
                     continue
 
                 last_keyframe_idx = self.current_window[0]
-                check_time = (cur_frame_idx - last_keyframe_idx) >= self.kf_interval    
+                check_time = (cur_frame_idx - last_keyframe_idx) >= self.kf_interval
                 curr_visibility = (render_pkg["n_touched"] > 0).long()
                 create_kf = self.is_keyframe(
                     cur_frame_idx,
                     last_keyframe_idx,
                     curr_visibility,
-                    self.occ_aware_visibility,        
+                    self.occ_aware_visibility,
                 )
                 if len(self.current_window) < self.window_size:
                     union = torch.logical_or(
@@ -490,28 +710,28 @@ class FrontEnd(mp.Process):
                         check_time
                         and point_ratio < self.config["Training"]["kf_overlap"]
                     )
-                if self.single_thread:      
+                if self.single_thread:
                     create_kf = check_time and create_kf
-                if create_kf:       
+                if create_kf:
                     self.current_window, removed = self.add_to_window(
                         cur_frame_idx,
                         curr_visibility,
                         self.occ_aware_visibility,
                         self.current_window,
-                    )       
-                    depth_map = self.add_new_keyframe(      
+                    )
+                    depth_map = self.add_new_keyframe(
                         cur_frame_idx,
                         depth=render_pkg["depth"],
                         opacity=render_pkg["opacity"],
                         init=False,
                     )
                     Log("new keyframe: ", cur_frame_idx)
-                    self.request_keyframe(   
+                    self.request_keyframe(
                         cur_frame_idx, viewpoint, self.current_window, depth_map
                     )
                 else:
                     self.cleanup(cur_frame_idx)
-                cur_frame_idx += 1              
+                cur_frame_idx += 1
 
                 if (                    # Perform trajectory evaluation when certain conditions are met
                     self.save_results
@@ -528,7 +748,7 @@ class FrontEnd(mp.Process):
                         monocular=self.monocular,
                     )
                 toc.record()
-                torch.cuda.synchronize()      
+                torch.cuda.synchronize()
                 if create_kf:
                     duration = tic.elapsed_time(toc)
                     time.sleep(max(0.01, 1.0 / 3.0 - duration / 1000))
